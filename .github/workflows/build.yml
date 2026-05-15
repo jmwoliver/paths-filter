@@ -30,3 +30,22 @@ jobs:
     - name: filter-test
       if: steps.filter.outputs.any != 'true' || steps.filter.outputs.error == 'true'
       run: exit 1
+
+  # Verifies the push-event git fallback path still works when no token is provided.
+  # The default self-test job above covers the new push-event API path (push + default token).
+  test-push-no-token:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ./
+      id: filter
+      with:
+        token: ''
+        filters: |
+          any:
+            - "**/*"
+          error:
+            - not_existing_path/**/*
+    - name: filter-test
+      if: steps.filter.outputs.any != 'true' || steps.filter.outputs.error == 'true'
+      run: exit 1

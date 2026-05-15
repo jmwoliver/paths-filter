@@ -74,6 +74,9 @@ For more scenarios see [examples](#examples) section.
 - It's recommended to quote your path expressions with `'` or `"`. Otherwise, you will get an error if it starts with `*`.
 - Local execution with [act](https://github.com/nektos/act) works only with alternative runner image. Default runner doesn't have `git` binary.
   - Use: `act -P ubuntu-latest=nektos/act-environments-ubuntu:18.04`
+- On `push` and `pull_request` events, when a `token` is provided (the default is `${{ github.token }}`),
+  changes are detected via the GitHub REST API and `actions/checkout` is not required. Set `token: ''`
+  to fall back to local git-based detection (requires a prior `actions/checkout` step).
 
 ## What's New
 
@@ -345,6 +348,37 @@ jobs:
       with:
         filters: ... # Configure your filters
 ```
+
+</details>
+
+<details>
+  <summary><b>Push events without checkout:</b> Detect changes via the GitHub Compare API</summary>
+
+When triggered by a `push` event with a `token` available, the action uses the GitHub
+Compare API instead of local git, so `actions/checkout` is not required:
+
+```yaml
+on:
+  push:
+    branches:
+      - master
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: dorny/paths-filter@v4
+      id: filter
+      with:
+        filters: ... # Configure your filters
+```
+
+Notes:
+- First push of a new branch compares against the repository's default branch.
+- Initial repo push (or first tag push) lists every file at the pushed commit as `added`.
+- Force-push to a SHA that is no longer reachable will fail; provide an explicit `base`
+  or unset `token` to fall back to git in that case.
 
 </details>
 
