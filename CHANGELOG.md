@@ -1,5 +1,8 @@
 # Changelog
 
+## v4.1.0
+- Use GitHub Compare API for push events when a token is available, removing the need for `actions/checkout` on push-event workflows ([#201](https://github.com/dorny/paths-filter/issues/201))
+
 ## v4.0.0
 - [Update action runtime to node24](https://github.com/dorny/paths-filter/pull/294)
 

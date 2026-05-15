@@ -125,6 +125,16 @@ async function getChangedFiles(token: string, base: string, ref: string, initial
       }
       break
     }
+    // For push events, prefer the GitHub Compare API when a token is available -
+    // mirrors the pull_request path above and removes the need for actions/checkout.
+    case 'push': {
+      if (token) {
+        const push = github.context.payload as PushEvent
+        return await getChangedFilesFromApiCompare(token, push)
+      }
+      // no token → fall through to the existing git path
+      break
+    }
   }
 
   return getChangedFilesFromGit(base, ref, initialFetchDepth)
@@ -192,6 +202,30 @@ async function getChangedFilesFromGit(base: string, head: string, initialFetchDe
   return await git.getChangesSinceMergeBase(base, head, initialFetchDepth)
 }
 
+// Pure helper: maps GitHub Files API response items (pulls.listFiles or
+// repos.compareCommitsWithBasehead) to the action's File[] type.
+// Rename detection is turned off, so renames are split into add + delete.
+export function mapApiFilesToFileList(
+  apiFiles: Array<{filename: string; status: string; previous_filename?: string}>
+): File[] {
+  const result: File[] = []
+  for (const row of apiFiles) {
+    if (row.status === ChangeStatus.Renamed) {
+      result.push({filename: row.filename, status: ChangeStatus.Added})
+      result.push({
+        // 'previous_filename' for some unknown reason isn't in the type definition or documentation
+        filename: row.previous_filename as string,
+        status: ChangeStatus.Deleted
+      })
+    } else {
+      // Github status and git status variants are same except for deleted files
+      const status = row.status === 'removed' ? ChangeStatus.Deleted : (row.status as ChangeStatus)
+      result.push({filename: row.filename, status})
+    }
+  }
+  return result
+}
+
 // Uses github REST api to get list of files changed in PR
 async function getChangedFilesFromApi(token: string, pullRequest: PullRequest): Promise<File[]> {
   core.startGroup(`Fetching list of changed files for PR#${pullRequest.number} from GitHub API`)
@@ -214,33 +248,119 @@ async function getChangedFilesFromApi(token: string, pullRequest: PullRequest): 
       }
       core.info(`Received ${response.data.length} items`)
 
-      for (const row of response.data as GetResponseDataTypeFromEndpointMethod<typeof client.rest.pulls.listFiles>) {
+      const apiRows = response.data as GetResponseDataTypeFromEndpointMethod<typeof client.rest.pulls.listFiles>
+      for (const row of apiRows) {
         core.info(`[${row.status}] ${row.filename}`)
-        // There's no obvious use-case for detection of renames
-        // Therefore we treat it as if rename detection in git diff was turned off.
-        // Rename is replaced by delete of original filename and add of new filename
-        if (row.status === ChangeStatus.Renamed) {
-          files.push({
-            filename: row.filename,
-            status: ChangeStatus.Added
-          })
-          files.push({
-            // 'previous_filename' for some unknown reason isn't in the type definition or documentation
-            filename: (<any>row).previous_filename as string,
-            status: ChangeStatus.Deleted
-          })
-        } else {
-          // Github status and git status variants are same except for deleted files
-          const status = row.status === 'removed' ? ChangeStatus.Deleted : (row.status as ChangeStatus)
-          files.push({
-            filename: row.filename,
-            status
-          })
-        }
       }
+      files.push(
+        ...mapApiFilesToFileList(apiRows as Array<{filename: string; status: string; previous_filename?: string}>)
+      )
     }
 
     return files
+  } finally {
+    core.endGroup()
+  }
+}
+
+// Uses github REST api to get list of files changed between two commits on a push event.
+// Mirrors getChangedFilesFromApi for PR events. Handles three sub-cases:
+//   1. Normal push (before is a real SHA): repos.compareCommitsWithBasehead
+//   2. First push of new branch (before === NULL_SHA, default branch usable): same compare, basehead = defaultBranch...head
+//   3. Initial repo push (before === NULL_SHA, head is the default branch): git.getTree, all files marked Added
+async function getChangedFilesFromApiCompare(token: string, push: PushEvent): Promise<File[]> {
+  const client = github.getOctokit(token)
+  const owner = github.context.repo.owner
+  const repo = github.context.repo.repo
+  const head = push.after
+  const before = push.before
+
+  // Branch deletion push: nothing to detect.
+  if (head === git.NULL_SHA) {
+    core.info('Branch deletion push detected - returning empty file list')
+    return []
+  }
+
+  // Normal push: real before SHA, use Compare API directly.
+  if (before !== git.NULL_SHA) {
+    return await fetchCompareFromApi(client, owner, repo, before, head)
+  }
+
+  // First-push case (before === NULL_SHA): try comparing against the default branch
+  // if this push isn't itself targeting the default branch. Otherwise list all files.
+  const defaultBranch = github.context.payload.repository?.default_branch
+  const refName = push.ref.replace('refs/heads/', '').replace('refs/tags/', '')
+  const isTag = push.ref.startsWith('refs/tags/')
+
+  if (defaultBranch && !isTag && refName !== defaultBranch) {
+    core.info(`First push of branch detected - changes will be detected against default branch '${defaultBranch}'`)
+    return await fetchCompareFromApi(client, owner, repo, defaultBranch, head)
+  }
+
+  core.info('Initial repo push or first tag push detected - listing all files at HEAD via Trees API')
+  return await fetchAllFilesFromTreesApi(client, owner, repo, head)
+}
+
+async function fetchCompareFromApi(
+  client: ReturnType<typeof github.getOctokit>,
+  owner: string,
+  repo: string,
+  base: string,
+  head: string
+): Promise<File[]> {
+  core.startGroup(`Fetching changed files for ${base}...${head} from GitHub Compare API`)
+  try {
+    const per_page = 100
+    const files: File[] = []
+    core.info(`Invoking compareCommitsWithBasehead(basehead: '${base}...${head}', per_page: ${per_page})`)
+    for await (const response of client.paginate.iterator(
+      client.rest.repos.compareCommitsWithBasehead.endpoint.merge({
+        owner,
+        repo,
+        basehead: `${base}...${head}`,
+        per_page
+      })
+    )) {
+      if (response.status !== 200) {
+        throw new Error(`Fetching changed files from GitHub Compare API failed with error code ${response.status}`)
+      }
+      const apiFiles =
+        (response.data as {files?: Array<{filename: string; status: string; previous_filename?: string}>}).files || []
+      core.info(`Received ${apiFiles.length} items`)
+      for (const row of apiFiles) {
+        core.info(`[${row.status}] ${row.filename}`)
+      }
+      files.push(...mapApiFilesToFileList(apiFiles))
+    }
+    return files
+  } finally {
+    core.endGroup()
+  }
+}
+
+async function fetchAllFilesFromTreesApi(
+  client: ReturnType<typeof github.getOctokit>,
+  owner: string,
+  repo: string,
+  head: string
+): Promise<File[]> {
+  core.startGroup(`Listing all files at ${head} from GitHub Trees API`)
+  try {
+    const response = await client.rest.git.getTree({
+      owner,
+      repo,
+      tree_sha: head,
+      recursive: 'true'
+    })
+    if (response.data.truncated) {
+      core.warning('Tree response was truncated by GitHub (>100k entries) - file list may be incomplete')
+    }
+    return response.data.tree
+      .filter(entry => entry.type === 'blob' && entry.path !== undefined)
+      .map(entry => ({
+        filename: entry.path as string,
+        status: ChangeStatus.Added
+      }))
   } finally {
     core.endGroup()
   }
@@ -305,4 +425,9 @@ function getErrorMessage(error: unknown): string {
   return String(error)
 }
 
-run()
+// Only execute when this file is the program entrypoint (e.g. the ncc-bundled
+// dist/index.js running under the Actions runtime). When imported by tests, the
+// top-level run() must not fire - its core.getInput calls would error.
+if (require.main === module) {
+  run()
+}
